@@ -76,12 +76,12 @@ MMAL_COMPONENT_T *camera = 0, *jpegencoder = 0, *jpegencoder2 = 0, *h264encoder 
 MMAL_CONNECTION_T *con_cam_res, *con_res_jpeg, *con_cam_h264, *con_cam_jpeg;
 FILE *jpegoutput_file = NULL, *jpegoutput2_file = NULL, *h264output_file = NULL, *status_file = NULL;
 MMAL_POOL_T *pool_jpegencoder, *pool_jpegencoder2, *pool_h264encoder;
-unsigned int tl_cnt=0, mjpeg_cnt=0, width=320, divider=5, image_cnt=0, image2_cnt=0, video_cnt=0;
+unsigned int tl_cnt=0, mjpeg_cnt=0, width=512, height=256, divider=5, image_cnt=0, image2_cnt=0, video_cnt=0;
 unsigned int cam_setting_sharpness=0, cam_setting_contrast=0, cam_setting_brightness=50, cam_setting_saturation=0, cam_setting_iso=0, cam_setting_vs=0, cam_setting_ec=0, cam_setting_rotation=0, cam_setting_quality=85, cam_setting_raw=0, cam_setting_ce_en=0, cam_setting_ce_u=128, cam_setting_ce_v=128, cam_setting_hflip=0, cam_setting_vflip=0, cam_setting_annback=0;
 char cam_setting_em[20]="auto", cam_setting_wb[20]="auto", cam_setting_ie[20]="none", cam_setting_mm[20]="average";
 unsigned long int cam_setting_bitrate=17000000, cam_setting_roi_x=0, cam_setting_roi_y=0, cam_setting_roi_w=65536, cam_setting_roi_h=65536, cam_setting_ss=0;
 unsigned int video_width=1920, video_height=1080, video_fps=25, MP4Box_fps=25, image_width=2592, image_height=1944;
-char *jpeg_filename = 0, *jpeg2_filename = 0, *h264_filename = 0, *pipe_filename = 0, *status_filename = 0, *cam_setting_annotation = 0;
+char *jpeg_filename = 0, *jpeg2_filename = 0, *h264_filename = 0, *thumb_filename = 0, *pipe_filename = 0, *status_filename = 0, *cam_setting_annotation = 0;
 unsigned char timelapse=0, mp4box=0, running=1, autostart=1, quality=85, idle=0, capturing=0, motion_detection=0;
 int time_between_pic;
 time_t currTime;
@@ -229,6 +229,56 @@ static void h264encoder_buffer_callback (MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T
     if (!new_buffer || status != MMAL_SUCCESS) error("Could not send buffers to port");
   }
 
+}
+
+void resize (int width, int height)
+{
+  MMAL_STATUS_T status;
+  MMAL_ES_FORMAT_T *format;
+  int max, i;
+
+  mmal_port_disable(jpegencoder->output[0]);
+  mmal_connection_destroy(con_cam_res);
+  mmal_connection_destroy(con_res_jpeg);
+
+  format = resizer->output[0]->format;
+  format->es->video.width = width;
+  format->es->video.height = height;
+  format->es->video.crop.x = 0;
+  format->es->video.crop.y = 0;
+  format->es->video.crop.width = width;
+  format->es->video.crop.height = height;
+  format->es->video.frame_rate.num = 30;
+  format->es->video.frame_rate.den = 1;
+  status = mmal_port_format_commit(resizer->output[0]);
+  if(status != MMAL_SUCCESS) error("Could not set image resizer output");
+  
+  status = mmal_component_enable(resizer);
+  if(status != MMAL_SUCCESS) error("Could not enable image resizer");
+
+  //
+  // connect
+  //
+  status = mmal_connection_create(&con_cam_res, camera->output[0], resizer->input[0], MMAL_CONNECTION_FLAG_TUNNELLING | MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT);
+  if(status != MMAL_SUCCESS) error("Could not create connection camera -> resizer");
+  status = mmal_connection_enable(con_cam_res);
+  if(status != MMAL_SUCCESS) error("Could not enable connection camera -> resizer");
+  
+  status = mmal_connection_create(&con_res_jpeg, resizer->output[0], jpegencoder->input[0], MMAL_CONNECTION_FLAG_TUNNELLING | MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT);
+  if(status != MMAL_SUCCESS) error("Could not create connection resizer -> encoder");
+  status = mmal_connection_enable(con_res_jpeg);
+  if(status != MMAL_SUCCESS) error("Could not enable connection resizer -> encoder");
+
+  status = mmal_port_enable(jpegencoder->output[0], jpegencoder_buffer_callback);
+  if(status != MMAL_SUCCESS) error("Could not enable jpeg port");
+  max = mmal_queue_length(pool_jpegencoder->queue);
+  for(i=0;i<max;i++) {
+    MMAL_BUFFER_HEADER_T *jpegbuffer = mmal_queue_get(pool_jpegencoder->queue);
+
+    if(!jpegbuffer) error("Could not create jpeg buffer header");
+    status = mmal_port_send_buffer(jpegencoder->output[0], jpegbuffer);
+    if(status != MMAL_SUCCESS) error("Could not send buffers to jpeg port");
+  }
 }
 
 void cam_set_sharpness () {
@@ -437,8 +487,11 @@ void cam_set_annotation () {
   if(status != MMAL_SUCCESS) error("Could not set annotation");
 }
 
-void start_all (void) {
-
+void start_all (int limit) {
+  char *cmd;
+  asprintf(&cmd, "cpulimit -b --exe=MP4Box -l %d", limit);
+  system(cmd);
+  free(cmd);
   MMAL_ES_FORMAT_T *format;
   int max, i;
   
@@ -554,6 +607,9 @@ void start_all (void) {
   status = mmal_port_parameter_set_uint32(jpegencoder2->output[0], MMAL_PARAMETER_JPEG_Q_FACTOR, 85);
   if(status != MMAL_SUCCESS) error("Could not set jpeg quality 2");
 
+  MMAL_PARAMETER_THUMBNAIL_CONFIG_T param_thumb = { {MMAL_PARAMETER_THUMBNAIL_CONFIGURATION, sizeof(MMAL_PARAMETER_THUMBNAIL_CONFIG_T)}, 1, 512, 256, 85};
+  status = mmal_port_parameter_set(jpegencoder2->control, &param_thumb.hdr);
+
   status = mmal_component_enable(jpegencoder2);
   if(status != MMAL_SUCCESS) error("Could not enable image encoder 2");
   pool_jpegencoder2 = mmal_port_pool_create(jpegencoder2->output[0], jpegencoder2->output[0]->buffer_num, jpegencoder2->output[0]->buffer_size);
@@ -611,7 +667,7 @@ void start_all (void) {
   
   format = resizer->output[0]->format;
   format->es->video.width = width;
-  format->es->video.height = height_temp;
+  format->es->video.height = height!=0?height:height_temp;
   format->es->video.crop.x = 0;
   format->es->video.crop.y = 0;
   format->es->video.crop.width = width;
@@ -693,6 +749,8 @@ void start_all (void) {
 
 void stop_all (void) {
 
+  system("killall -9 cpulimit");
+
   mmal_port_disable(jpegencoder->output[0]);
   mmal_connection_destroy(con_cam_res);
   mmal_connection_destroy(con_res_jpeg);
@@ -703,6 +761,31 @@ void stop_all (void) {
   mmal_component_destroy(h264encoder);
   mmal_component_destroy(camera);
 
+}
+
+static int mp4boxPipe[2];
+
+void *worker_thread(void *arg)
+{
+  char *filename_temp, *filename_temp2, *cmd_temp;
+  size_t len = 0;
+  ssize_t read;
+  FILE *mp4boxStream = fdopen (mp4boxPipe[0], "r");
+  while ((read=getline(&filename_temp, &len, mp4boxStream)) != -1) {
+    filename_temp[read-1]=0;
+    printf("Boxing started on %s\n", filename_temp);
+    asprintf(&cmd_temp, "nice -n 19 MP4Box -add %s.h264 %s > /dev/null", filename_temp, filename_temp);
+    if(system(cmd_temp) == -1) error("Could not start MP4Box");
+    asprintf(&filename_temp2, "%s.h264", filename_temp);
+    remove(filename_temp2);
+    free(filename_temp2);
+    free(cmd_temp);
+    printf("Boxing stopped\n");
+    filename_temp[read-1]='\n';
+  }
+  free(filename_temp);
+  fclose (mp4boxStream);
+  return NULL;
 }
 
 void capt_img (void) {
@@ -748,6 +831,25 @@ int main (int argc, char* argv[]) {
       printf("\n");
       exit(0);
     }
+    else if(strcmp(argv[i], "-w") == 0) {
+      i++;
+      width = atoi(argv[i]);
+    }
+    else if(strcmp(argv[i], "-h") == 0) {
+      i++;
+      height = atoi(argv[i]);
+    }
+    else if(strcmp(argv[i], "-q") == 0) {
+      i++;
+      quality = atoi(argv[i]);
+    }
+    else if(strcmp(argv[i], "-d") == 0) {
+      i++;
+      divider = atoi(argv[i]);
+    }
+    else if(strcmp(argv[i], "-p") == 0) {
+      mp4box = 1;
+    }
     else if(strcmp(argv[i], "-ic") == 0) {
       i++;
       image2_cnt = atoi(argv[i]);
@@ -755,6 +857,34 @@ int main (int argc, char* argv[]) {
     else if(strcmp(argv[i], "-vc") == 0) {
       i++;
       video_cnt = atoi(argv[i]);
+    }
+    else if(strcmp(argv[i], "-of") == 0) {
+      i++;
+      jpeg_filename = argv[i];
+    }
+    else if(strcmp(argv[i], "-if") == 0) {
+      i++;
+      jpeg2_filename = argv[i];
+    }
+    else if(strcmp(argv[i], "-cf") == 0) {
+      i++;
+      pipe_filename = argv[i];
+    }
+    else if(strcmp(argv[i], "-vf") == 0) {
+      i++;
+      h264_filename = argv[i];
+    }
+    else if(strcmp(argv[i], "-tf") == 0) {
+      i++;
+      thumb_filename = argv[i];
+    }
+    else if(strcmp(argv[i], "-sf") == 0) {
+      i++;
+      status_filename = argv[i];
+    }
+    else if(strcmp(argv[i], "-pa") == 0) {
+      autostart = 0;
+      idle = 1;
     }
     else if(strcmp(argv[i], "-md") == 0) {
       motion_detection = 1;
@@ -922,7 +1052,7 @@ int main (int argc, char* argv[]) {
   //
   // init
   //
-  if(autostart) start_all();
+  if(autostart) start_all(1);
   if(motion_detection) {
     if(system("motion") == -1) error("Could not start Motion");
   }
@@ -958,6 +1088,16 @@ int main (int argc, char* argv[]) {
     fclose(status_file);
   }
   
+  if (pipe(mp4boxPipe))
+  {
+    fprintf (stderr, "Pipe failed.\n");
+    return EXIT_FAILURE;
+  }
+  FILE *mp4boxStream = fdopen (mp4boxPipe[1], "w");
+  // pthread_t worker;
+  // pthread_create(&worker, 0, worker_thread, NULL);
+  // pthread_detach(worker);
+
   while(running) {
     if(pipe_filename != 0) {
 
@@ -1028,19 +1168,23 @@ int main (int argc, char* argv[]) {
               h264output_file = NULL;
               printf("Capturing stopped\n");
               if(mp4box) {
-                printf("Boxing started\n");
-                status_file = fopen(status_filename, "w");
-                if(!motion_detection) fprintf(status_file, "boxing");
-                else fprintf(status_file, "md_boxing");
-                fclose(status_file);
-                asprintf(&cmd_temp, "MP4Box -fps %i -add %s.h264 %s > /dev/null", MP4Box_fps, filename_recording, filename_recording);
-                if(system(cmd_temp) == -1) error("Could not start MP4Box");
-                asprintf(&filename_temp, "%s.h264", filename_recording);
-                remove(filename_temp);
-                free(filename_temp);
-                free(filename_recording);
-                free(cmd_temp);
-                printf("Boxing stopped\n");
+                fprintf(mp4boxStream, "%s\n", filename_mp4);
+                fflush(mp4boxStream);
+                free(filename_mp4);
+                // printf("Boxing started\n");
+                // status_file = fopen(status_filename, "w");
+                // if(!motion_detection) fprintf(status_file, "boxing");
+                // else fprintf(status_file, "md_boxing");
+                // fclose(status_file);
+                // asprintf(&filename_recording, h264_filename, localTime->tm_year+1900, localTime->tm_mon+1, localTime->tm_mday, localTime->tm_hour, localTime->tm_min, localTime->tm_sec);
+                // asprintf(&cmd_temp, "MP4Box -fps %i -add %s.h264 %s > /dev/null", MP4Box_fps, filename_recording, filename_recording);
+                // if(system(cmd_temp) == -1) error("Could not start MP4Box");
+                // asprintf(&filename_temp, "%s.h264", filename_recording);
+                // remove(filename_temp);
+                // free(filename_temp);
+                // free(filename_recording);
+                // free(cmd_temp);
+                // printf("Boxing stopped\n");
               }
               video_cnt++;
               if(status_filename != 0) {
@@ -1285,7 +1429,10 @@ int main (int argc, char* argv[]) {
             }
           }
           else {
-            start_all();
+            readbuf[0] = ' ';
+            readbuf[1] = ' ';
+            readbuf[length] = 0;
+            start_all(atoi(readbuf));
             idle = 0;
             printf("Stream continued\n");
             if(status_filename != 0) {
@@ -1317,6 +1464,11 @@ int main (int argc, char* argv[]) {
             }
           }
         }
+        else if((readbuf[0]=='w') && (readbuf[1]=='h')) {
+          readbuf[length] = 0;
+          sscanf(readbuf, "wh %dx%d", &width, &height);
+          resize(width, height);
+        }
       }
 
     }
@@ -1334,6 +1486,8 @@ int main (int argc, char* argv[]) {
   
   printf("SIGINT/SIGTERM received, stopping\n");
   
+  fclose (mp4boxStream);
+    
   //
   // tidy up
   //
